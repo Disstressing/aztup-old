@@ -1,0 +1,967 @@
+-- ═══════════════════════════════════════════════════════
+-- PASTE YOUR SAVED TIMING OVERRIDES HERE (or leave nil)
+-- ═══════════════════════════════════════════════════════
+local SAVED_DB = nil
+-- ═══════════════════════════════════════════════════════
+
+-- ═══════════════════════════════════════════════════════
+-- PASTE YOUR ANIMATION DATABASE BELOW
+-- ═══════════════════════════════════════════════════════
+local ANIM_DB = {
+-- FORMAT: [animId] = {timing, "weapon", "name"}
+
+}
+-- ═══════════════════════════════════════════════════════
+
+--[[
+     AUTO-PARRY v4.1 — UI Edition (Yin & Yang)
+     Press F1 to toggle the menu.
+     Learning: enable Learning Mode, then press F near an enemy.
+]]
+
+-- ┌────────────────────────────────────────────────┐
+-- │          FRAME DRIVER (Heartbeat)              │
+-- └────────────────────────────────────────────────┘
+
+local function CreateSignal()
+    local sig = { _c = {} }
+    function sig:Connect(fn)
+        local c = { fn = fn, on = true }
+        sig._c[#sig._c + 1] = c
+        return { Disconnect = function() c.on = false; c.fn = nil end }
+    end
+    function sig:Fire(...)
+        local i = 1
+        while i <= #sig._c do
+            local c = sig._c[i]
+            if c.on then pcall(c.fn, ...); i += 1
+            else table.remove(sig._c, i) end
+        end
+    end
+    return sig
+end
+
+local Heartbeat = CreateSignal()
+task.spawn(function()
+    local last = os.clock()
+    while true do
+        local now  = os.clock()
+        local dt   = math.min(now - last, 0.1)
+        last       = now
+        Heartbeat:Fire(dt)
+        task.wait()
+    end
+end)
+
+-- ┌────────────────────────────────────────────────┐
+-- │              SERVICES & SETUP                  │
+-- └────────────────────────────────────────────────┘
+
+local UserInputService = game:GetService("UserInputService")
+local Players          = game:GetService("Players")
+local localPlayer      = Players.LocalPlayer
+local localPlayerName  = localPlayer.Name
+
+-- ┌────────────────────────────────────────────────┐
+-- │              CONFIGURATION                     │
+-- └────────────────────────────────────────────────┘
+
+local CFG = {
+    MAX_DISTANCE    = 50,
+    PARRY_RANGE     = 15,
+    ENEMY_SCAN_RATE = 5,
+    SCANNER_RATE    = 30,
+    USE_HITBOX      = true,
+    HITBOX_WIDTH    = 14,
+    HITBOX_HEIGHT   = 15,
+    PARRY_WINDOW    = 0.08,
+    PARRY_COOLDOWN  = 0.22,
+    PARRY_HOLD      = 0.05,
+    PARRY_KEY       = 0x46,
+    PARRY_KEYCODE   = Enum.KeyCode.F,
+    MAX_SAMPLES     = 20,
+}
+
+-- ┌────────────────────────────────────────────────┐
+-- │              MEMORY OFFSETS                    │
+-- └────────────────────────────────────────────────┘
+
+local OFF = {
+    Name             = 0xB0,
+    ClassDescriptor  = 0x18,
+    ClassName        = 0x8,
+    Primitive        = 0x148,
+    PrimPosition     = 0xE4,
+    PrimRotation     = 0xC0,
+    AnimTrackAnim    = 0xD0,
+    AnimId           = 0xD0,
+    AnimTrackTimePos = 0xE8,
+    AnimTrackSpeed   = 0xE4,
+    AnimTrackLooped  = 0xF5,
+    ActiveAnimations = 0x648,
+    NodeNext         = 0x10,
+}
+
+-- ┌────────────────────────────────────────────────┐
+-- │              RUNTIME STATE                     │
+-- └────────────────────────────────────────────────┘
+
+local S = {
+    showScanner    = false,
+    learningOn     = false,
+    parryOn        = false,
+    parryCount     = 0,
+    lastParryAt    = 0,
+    isParrying     = false,
+    autoParryFired = false,
+    lastRecordedId = nil,
+    tracker        = {},
+    parryLog       = {},
+    fps            = 0,
+    _fpsTick       = 0,
+    _fpsTime       = os.clock(),
+    learnedTimings = {},
+}
+
+local TrackedEnemies = {}
+
+-- ┌────────────────────────────────────────────────┐
+-- │            MEMORY READ HELPERS                 │
+-- └────────────────────────────────────────────────┘
+
+local function RStr(a)
+    if not a or a <= 4096 then return nil end
+    local ok, v = pcall(memory_read, "string", a)
+    return ok and v or nil
+end
+local function RPtr(a)
+    if not a or type(a) ~= "number" then return nil end
+    local ok, v = pcall(memory_read, "uintptr_t", a)
+    return (ok and v and v > 4096) and v or nil
+end
+local function RFlt(a)
+    if not a or type(a) ~= "number" then return nil end
+    local ok, v = pcall(memory_read, "float", a)
+    return (ok and type(v) == "number") and v or nil
+end
+local function RBool(a)
+    if not a or type(a) ~= "number" then return nil end
+    local ok, v = pcall(memory_read, "bool", a)
+    return ok and v or nil
+end
+local function ClsName(a)
+    if not a or a <= 4096 then return "" end
+    local d = RPtr(a + OFF.ClassDescriptor)
+    return d and (RStr(RPtr(d + OFF.ClassName)) or "") or ""
+end
+
+-- ┌────────────────────────────────────────────────┐
+-- │          ANIMATION TRACK READING               │
+-- └────────────────────────────────────────────────┘
+
+local function ReadAnimId(trackAddr)
+    local animObj = RPtr(trackAddr + OFF.AnimTrackAnim)
+    if not animObj or ClsName(animObj) ~= "Animation" then return nil, nil end
+    return RStr(RPtr(animObj + OFF.AnimId)), RStr(RPtr(animObj + OFF.Name))
+end
+
+local function GetAnimatorAddr(char)
+    if not char then return nil end
+    local h = char:FindFirstChild("Humanoid")
+    if not h then return nil end
+    local a = h:FindFirstChild("Animator")
+    return (a and a.Address ~= 0) and a.Address or nil
+end
+
+local function ReadTracks(char)
+    local aa = GetAnimatorAddr(char)
+    if not aa then return {} end
+    local head = RPtr(aa + OFF.ActiveAnimations)
+    if not head then return {} end
+    local first = RPtr(head)
+    if not first or first == head then return {} end
+    local node, out, n = first, {}, 0
+    while n < 80 do
+        n += 1
+        if type(node) ~= "number" or node == 0 or node == head then break end
+        local track = RPtr(node + OFF.NodeNext)
+        if track and ClsName(track) == "AnimationTrack" then
+            local id, name = ReadAnimId(track)
+            if id then
+                out[#out+1] = {
+                    id      = id,
+                    name    = name or "?",
+                    timePos = RFlt(track + OFF.AnimTrackTimePos) or 0,
+                    looped  = RBool(track + OFF.AnimTrackLooped) or false,
+                    speed   = RFlt(track + OFF.AnimTrackSpeed) or 1,
+                }
+            end
+        end
+        node = RPtr(node)
+        if not node then break end
+    end
+    return out
+end
+
+-- ┌────────────────────────────────────────────────┐
+-- │    POSITION, ROTATION, FACING DIRECTION        │
+-- └────────────────────────────────────────────────┘
+
+local function GetPrimitive(inst)
+    if not inst or not inst.Address or inst.Address == 0 then return nil end
+    return RPtr(inst.Address + OFF.Primitive)
+end
+
+local function GetPos(prim)
+    if not prim then return nil end
+    local x = RFlt(prim + OFF.PrimPosition)
+    local y = RFlt(prim + OFF.PrimPosition + 4)
+    local z = RFlt(prim + OFF.PrimPosition + 8)
+    return (x and y and z) and {x, y, z} or nil
+end
+
+local function GetFacing(prim)
+    if not prim then return nil, nil end
+    local r  = OFF.PrimRotation
+    local bx = RFlt(prim + r + 24)
+    local by = RFlt(prim + r + 28)
+    local bz = RFlt(prim + r + 32)
+    if not bx or not by or not bz then
+        bx = RFlt(prim + r + 8)
+        by = RFlt(prim + r + 20)
+        bz = RFlt(prim + r + 32)
+        if not bx or not by or not bz then return nil, nil end
+    end
+    local look = {-bx, -by, -bz}
+    local rlen = math.sqrt(look[3]*look[3] + look[1]*look[1])
+    local right
+    if rlen > 0.001 then
+        right = {look[3]/rlen, 0, -look[1]/rlen}
+    else
+        right = {1, 0, 0}
+    end
+    return look, right
+end
+
+local function DistBetween(p1, p2)
+    local dx, dy, dz = p1[1]-p2[1], p1[2]-p2[2], p1[3]-p2[3]
+    return math.sqrt(dx*dx + dy*dy + dz*dz)
+end
+
+-- ┌────────────────────────────────────────────────┐
+-- │           ENEMY DISCOVERY                      │
+-- └────────────────────────────────────────────────┘
+
+local function DiscoverEnemies()
+    local ents = game.Workspace:FindFirstChild("Entities")
+    if not ents then TrackedEnemies = {}; return end
+    local out = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name == localPlayerName then continue end
+        local ch = ents:FindFirstChild(p.Name)
+        if ch then
+            out[#out+1] = {
+                name = p.Name, char = ch,
+                dist = 999, pos = nil, look = nil, right = nil,
+                tracks = {},
+            }
+        end
+    end
+    TrackedEnemies = out
+end
+
+-- ┌────────────────────────────────────────────────┐
+-- │   PER-ANIMATION CONFIG                         │
+-- └────────────────────────────────────────────────┘
+
+local function GetAnimConfig(animData)
+    local v4 = animData[4]
+    if type(v4) == "table" then
+        return {
+            depth  = v4.d  or CFG.PARRY_RANGE,
+            width  = v4.w  or CFG.HITBOX_WIDTH,
+            height = v4.h  or CFG.HITBOX_HEIGHT,
+            ox = v4.ox or 0, oy = v4.oy or 0, oz = v4.oz or 0,
+            mh = v4.mh,
+        }
+    elseif type(v4) == "number" then
+        return {
+            depth  = v4,
+            width  = animData[5] or CFG.HITBOX_WIDTH,
+            height = CFG.HITBOX_HEIGHT,
+            ox = 0, oy = 0, oz = 0, mh = animData[6],
+        }
+    else
+        return {
+            depth  = CFG.PARRY_RANGE, width = CFG.HITBOX_WIDTH,
+            height = CFG.HITBOX_HEIGHT,
+            ox = 0, oy = 0, oz = 0, mh = nil,
+        }
+    end
+end
+
+-- ┌────────────────────────────────────────────────┐
+-- │       DIRECTIONAL HITBOX CHECK                 │
+-- └────────────────────────────────────────────────┘
+
+local function IsInHitbox(ePos, eLook, eRight, pPos, cfg)
+    local ox = ePos[1] + (eRight and eRight[1]*cfg.ox or 0)
+    local oy = ePos[2] + cfg.oy
+    local oz = ePos[3] + (eRight and eRight[3]*cfg.ox or 0)
+    if cfg.oz ~= 0 then
+        local lx, lz = eLook[1], eLook[3]
+        local ll = math.sqrt(lx*lx + lz*lz)
+        if ll > 0.001 then ox += (lx/ll)*cfg.oz; oz += (lz/ll)*cfg.oz end
+    end
+    local dx, dy, dz = pPos[1]-ox, pPos[2]-oy, pPos[3]-oz
+    if math.abs(dy) > cfg.height then return false end
+    local lx, lz = eLook[1], eLook[3]
+    local len = math.sqrt(lx*lx + lz*lz)
+    if len < 0.001 then return true end
+    lx, lz = lx/len, lz/len
+    local fwd = dx*lx + dz*lz
+    local lat = math.abs(-dx*lz + dz*lx)
+    return fwd >= -2 and fwd <= cfg.depth and lat <= cfg.width * 0.5
+end
+
+-- ┌────────────────────────────────────────────────┐
+-- │             PARRY EXECUTION                    │
+-- └────────────────────────────────────────────────┘
+
+local function ShortId(id)
+    if not id then return "?" end
+    local n = id:match("(%d+)$")
+    return (n and #n > 6) and ("..." .. n:sub(-6)) or id
+end
+
+local function DoParry()
+    task.spawn(function()
+        keypress(CFG.PARRY_KEY)
+        task.wait(CFG.PARRY_HOLD)
+        keyrelease(CFG.PARRY_KEY)
+        S.isParrying = false
+    end)
+end
+
+local function TryParry()
+    if S.isParrying then return false end
+    local now = os.clock()
+    if now - S.lastParryAt < CFG.PARRY_COOLDOWN then return false end
+    S.isParrying     = true
+    S.lastParryAt    = now
+    S.parryCount    += 1
+    S.autoParryFired = true
+    task.delay(0.20, function() S.autoParryFired = false end)
+    DoParry()
+    return true
+end
+
+-- ┌────────────────────────────────────────────────┐
+-- │     TIMING LOOKUP + LEARNING HELPERS           │
+-- └────────────────────────────────────────────────┘
+
+local function GetAnimData(id) return ANIM_DB[id] end
+
+local function GetParryTiming(id, animData)
+    local learned = S.learnedTimings[id]
+    if learned and #learned > 0 then
+        local s = {}
+        for i = 1, #learned do s[i] = learned[i] end
+        table.sort(s)
+        local m = math.floor(#s/2) + 1
+        return (#s % 2 == 0) and (s[m-1]+s[m])/2 or s[m]
+    end
+    return animData[1]
+end
+
+-- ┌────────────────────────────────────────────────┐
+-- │    F-PRESS LEARNING                            │
+-- └────────────────────────────────────────────────┘
+
+local function RecordTimingFromFPress()
+    local myChar = localPlayer.Character
+    if not myChar then return end
+    local myHRP  = myChar:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return end
+    local myPrim = GetPrimitive(myHRP)
+    local myPos  = GetPos(myPrim)
+    if not myPos then return end
+
+    local bestEnemy, bestDist = nil, CFG.PARRY_RANGE + 1
+    for _, e in ipairs(TrackedEnemies) do
+        if e.dist < bestDist then bestDist = e.dist; bestEnemy = e end
+    end
+    if not bestEnemy then print("[Learn] No enemies in range"); return end
+
+    local tracks = ReadTracks(bestEnemy.char)
+    if #tracks == 0 then print("[Learn] No anims on " .. bestEnemy.name); return end
+
+    local candidates = {}
+    for _, t in ipairs(tracks) do
+        local ad = GetAnimData(t.id)
+        if ad and not t.looped and t.timePos >= 0.02 and t.timePos < 0.60 then
+            candidates[#candidates+1] = t
+        end
+    end
+    if #candidates == 0 then print("[Learn] No whitelisted attacks"); return end
+
+    table.sort(candidates, function(a, b) return a.timePos > b.timePos end)
+    local best = candidates[1]
+
+    if not S.learnedTimings[best.id] then S.learnedTimings[best.id] = {} end
+    local samples = S.learnedTimings[best.id]
+    samples[#samples+1] = best.timePos
+    while #samples > CFG.MAX_SAMPLES do table.remove(samples, 1) end
+
+    S.lastRecordedId = best.id
+    local ad   = GetAnimData(best.id)
+    local newT = GetParryTiming(best.id, ad)
+    local msg  = string.format("[Learn] %s/%s @ %.3fs → %.3fs (%d samples)",
+        ad[2], ad[3], best.timePos, newT, #samples)
+    print(msg)
+    if _G.AP_Notify then _G.AP_Notify(msg, 4) end
+end
+
+-- ┌────────────────────────────────────────────────┐
+-- │          CONFIG EXPORT / IMPORT                │
+-- └────────────────────────────────────────────────┘
+
+local function CopyArr(t)
+    local c = {}; for i = 1, #t do c[i] = t[i] end; return c
+end
+
+local function Ser(v, d)
+    d = d or 0
+    local t = type(v)
+    if t == "string"  then return string.format("%q", v)
+    elseif t == "number"  then return tostring(v)
+    elseif t == "boolean" then return tostring(v)
+    elseif t == "table" then
+        if d > 6 then return "{}" end
+        local al, isN = 0, true
+        for i = 1, 200 do
+            if v[i] == nil then break end; al = i
+            if type(v[i]) ~= "number" then isN = false end
+        end
+        if isN and al > 0 then
+            local tot = 0; for _ in pairs(v) do tot += 1 end
+            if tot == al then
+                local ns = {}
+                for i = 1, al do ns[i] = string.format("%.3f", v[i]) end
+                return "{" .. table.concat(ns, ", ") .. "}"
+            end
+        end
+        local ni, n0 = string.rep("  ", d+1), string.rep("  ", d)
+        local parts = {}
+        for i = 1, al do parts[#parts+1] = ni .. Ser(v[i], d+1) end
+        local hk = {}
+        for k in pairs(v) do
+            if not (type(k)=="number" and k>=1 and k<=al and k==math.floor(k)) then
+                hk[#hk+1] = k
+            end
+        end
+        table.sort(hk, function(a, b) return tostring(a) < tostring(b) end)
+        for _, k in ipairs(hk) do
+            local ks = (type(k)=="string" and k:match("^[%a_][%w_]*$")) and k
+                       or ("[" .. Ser(k, d+1) .. "]")
+            parts[#parts+1] = ni .. ks .. " = " .. Ser(v[k], d+1)
+        end
+        if #parts == 0 then return "{}" end
+        return "{\n" .. table.concat(parts, ",\n") .. "\n" .. n0 .. "}"
+    end
+    return "nil"
+end
+
+local function ExportConfig()
+    local data = { animations = {} }
+    local cnt  = 0
+    for id, samples in pairs(S.learnedTimings) do
+        if #samples > 0 then
+            data.animations[id] = { parryTimes = CopyArr(samples) }
+            cnt += 1
+        end
+    end
+    if cnt == 0 then
+        print("[Export] No overrides to export")
+        if _G.AP_Notify then _G.AP_Notify("No overrides to export.", 3) end
+        return
+    end
+    print("\n-- ======================================================")
+    print(string.format("-- TIMING OVERRIDES  |  %d animation(s)", cnt))
+    print("-- ======================================================")
+    print("local SAVED_DB = " .. Ser(data))
+    print("-- ======================================================\n")
+    if _G.AP_Notify then
+        _G.AP_Notify(string.format("Exported %d override(s) to console.", cnt), 4)
+    end
+end
+
+local function ImportSavedDB()
+    if not SAVED_DB or type(SAVED_DB) ~= "table" or not SAVED_DB.animations then return end
+    local cnt = 0
+    for id, saved in pairs(SAVED_DB.animations) do
+        if saved.parryTimes and #saved.parryTimes > 0 then
+            S.learnedTimings[id] = CopyArr(saved.parryTimes)
+            cnt += 1
+        end
+    end
+    if cnt > 0 then print(string.format("[Config] Loaded %d timing override(s)", cnt)) end
+end
+
+-- ┌────────────────────────────────────────────────┐
+-- │           TRACKER CLEANUP                      │
+-- └────────────────────────────────────────────────┘
+
+local function CleanTrackers()
+    local now = os.clock()
+    for _, anims in pairs(S.tracker) do
+        for aid, d in pairs(anims) do
+            if now - d.lastSeen > 2.0 then anims[aid] = nil end
+        end
+    end
+end
+
+-- ┌────────────────────────────────────────────────┐
+-- │        MAIN HEARTBEAT HANDLER                  │
+-- └────────────────────────────────────────────────┘
+
+local frameTick = 0
+
+Heartbeat:Connect(function(dt)
+    frameTick += 1
+
+    S._fpsTick += 1
+    if os.clock() - S._fpsTime >= 1.0 then
+        S.fps = S._fpsTick; S._fpsTick = 0; S._fpsTime = os.clock()
+    end
+
+    if not S.parryOn and not S.showScanner then return end
+    if frameTick % CFG.ENEMY_SCAN_RATE == 0 then DiscoverEnemies() end
+
+    local myChar = localPlayer.Character
+    if not myChar then return end
+    local myHRP  = myChar:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return end
+    local myPrim = GetPrimitive(myHRP)
+    local myPos  = GetPos(myPrim)
+    if not myPos then return end
+
+    for _, enemy in ipairs(TrackedEnemies) do
+        local hrp = enemy.char:FindFirstChild("HumanoidRootPart")
+        if not hrp then continue end
+        local ePrim = GetPrimitive(hrp)
+        local ePos  = GetPos(ePrim)
+        if not ePos then continue end
+
+        enemy.dist = DistBetween(myPos, ePos)
+        enemy.pos  = ePos
+        if enemy.dist > CFG.MAX_DISTANCE then continue end
+
+        local inRange = enemy.dist <= CFG.PARRY_RANGE
+        if not inRange and not S.showScanner then continue end
+
+        local tracks = ReadTracks(enemy.char)
+        enemy.tracks = tracks
+
+        local eLook, eRight = nil, nil
+        if CFG.USE_HITBOX then
+            eLook, eRight = GetFacing(ePrim)
+            enemy.look  = eLook
+            enemy.right = eRight
+        end
+
+        -- ── AUTO-PARRY ──
+        if S.parryOn and inRange then
+            if not S.tracker[enemy.name] then S.tracker[enemy.name] = {} end
+            local et  = S.tracker[enemy.name]
+            local now = os.clock()
+
+            for _, t in ipairs(tracks) do
+                local animData = GetAnimData(t.id)
+                if not animData or t.looped then continue end
+
+                local cfg = GetAnimConfig(animData)
+
+                if CFG.USE_HITBOX and eLook then
+                    if not IsInHitbox(ePos, eLook, eRight, myPos, cfg) then continue end
+                end
+
+                local baseTime = GetParryTiming(t.id, animData)
+                local timings  = cfg.mh or { baseTime }
+
+                local prev  = et[t.id]
+                local isNew = false
+                if not prev then isNew = true
+                elseif t.timePos < prev.lastTP - 0.05 then isNew = true
+                elseif now - prev.lastSeen > 0.5      then isNew = true end
+
+                if isNew then
+                    et[t.id] = { lastTP=t.timePos, lastSeen=now, hitIdx=1, done=false }
+                else
+                    et[t.id].lastTP   = t.timePos
+                    et[t.id].lastSeen = now
+                end
+
+                local state = et[t.id]
+                if state.done then continue end
+
+                local idx    = state.hitIdx
+                if idx > #timings then state.done = true; continue end
+
+                local target = timings[idx]
+                local diff   = target - t.timePos
+
+                if diff >= -CFG.PARRY_WINDOW and diff <= CFG.PARRY_WINDOW then
+                    if TryParry() then
+                        state.hitIdx = idx + 1
+                        if state.hitIdx > #timings then state.done = true end
+                        local hitLabel = #timings > 1
+                            and string.format(" [hit %d/%d]", idx, #timings) or ""
+                        print(string.format("  [PARRY] %s | %s/%s @ %.3fs%s",
+                            enemy.name, animData[2], animData[3], t.timePos, hitLabel))
+                        S.parryLog[#S.parryLog+1] = {
+                            enemy  = enemy.name,
+                            anim   = animData[2] .. "/" .. animData[3],
+                            actual = t.timePos,
+                            target = target,
+                        }
+                        if _G.AP_Notify then
+                            _G.AP_Notify(string.format(
+                                "☯ Parried!  %s — %s", enemy.name, animData[3]), 2)
+                        end
+                    end
+                elseif diff < -CFG.PARRY_WINDOW then
+                    state.hitIdx = idx + 1
+                    if state.hitIdx > #timings then state.done = true end
+                end
+            end
+        end
+    end
+
+    if frameTick % 120 == 0 then CleanTrackers() end
+
+    -- ── SCANNER ──
+    if S.showScanner and frameTick % CFG.SCANNER_RATE == 0 then
+        for _, enemy in ipairs(TrackedEnemies) do
+            if enemy.dist > CFG.MAX_DISTANCE or not enemy.tracks then continue end
+            if #enemy.tracks == 0 then continue end
+            local atkN, otherN = 0, 0
+            for _, t in ipairs(enemy.tracks) do
+                if GetAnimData(t.id) and not t.looped then atkN += 1 else otherN += 1 end
+            end
+            print(string.format("[ %s ] %.1f st | %d whitelisted / %d other",
+                enemy.name, enemy.dist, atkN, otherN))
+            for _, t in ipairs(enemy.tracks) do
+                local ad = GetAnimData(t.id)
+                if ad and not t.looped then
+                    local timing = GetParryTiming(t.id, ad)
+                    local cfg    = GetAnimConfig(ad)
+                    local inHB   = ""
+                    if CFG.USE_HITBOX and enemy.look and enemy.pos then
+                        inHB = IsInHitbox(enemy.pos, enemy.look, enemy.right, myPos, cfg)
+                            and " ✓HB" or " ✗HB"
+                    end
+                    local ovr = S.learnedTimings[t.id] and " *" or ""
+                    print(string.format("  [ATK] %.3fs  %s/%s  t=%.3f%s%s",
+                        t.timePos, ad[2], ad[3], timing, ovr, inHB))
+                else
+                    local tag = t.looped and "loop" or "unk"
+                    print(string.format("  [%s] %.3fs  %s", tag, t.timePos, ShortId(t.id)))
+                end
+            end
+            print("---")
+        end
+    end
+end)
+
+-- ┌────────────────────────────────────────────────┐
+-- │    F-KEY INPUT (learning — outside menu)       │
+-- └────────────────────────────────────────────────┘
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == CFG.PARRY_KEYCODE then
+        if S.learningOn and not S.autoParryFired then
+            RecordTimingFromFPress()
+        end
+    end
+end)
+
+-- ┌────────────────────────────────────────────────┐
+-- │              LOAD UI LIBRARY                   │
+-- └────────────────────────────────────────────────┘
+
+local Menu = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/catowice/p/refs/heads/main/library.lua"
+))()
+
+assert(type(Menu) == "table",
+    "[AutoParry] UI library failed to load. Check executor HTTP permissions.")
+
+-- ┌────────────────────────────────────────────────┐
+-- │       YIN & YANG THEME                         │
+-- ┌────────────────────────────────────────────────┐
+
+Menu._theming = {
+    accent   = Color3.fromRGB(220, 220, 220),  -- Yang white accent
+    unsafe   = Color3.fromRGB(200, 70,  70),   -- danger red
+    body     = Color3.fromRGB(6,   6,   6),    -- Yin deep black
+    text     = Color3.fromRGB(235, 235, 235),  -- Yang bright text
+    subtext  = Color3.fromRGB(95,  95,  95),   -- balanced grey
+    border1  = Color3.fromRGB(48,  48,  48),   -- dark border
+    border0  = Color3.fromRGB(28,  28,  28),   -- deeper border
+    surface1 = Color3.fromRGB(38,  38,  38),   -- raised surface
+    surface0 = Color3.fromRGB(16,  16,  16),   -- recessed surface
+    crust    = Color3.fromRGB(0,   0,   0),    -- Yin pure black
+}
+
+Menu:SetMenuTitle("☯  Auto Parry")
+Menu:SetMenuSize(Vector2.new(420, 500))
+Menu:CenterMenu()
+
+-- ┌────────────────────────────────────────────────┐
+-- │        NOTIFICATION BRIDGE                     │
+-- └────────────────────────────────────────────────┘
+
+_G.AP_Notify = function(text, duration)
+    pcall(function() Menu:Notification(text, duration or 4) end)
+end
+
+-- ┌────────────────────────────────────────────────┐
+-- │        WATERMARK ACTIVITY                      │
+-- └────────────────────────────────────────────────┘
+
+Menu:RegisterActivity(function()
+    return string.format("☯ parries: %d  fps: %d", S.parryCount, S.fps)
+end)
+
+-- ┌────────────────────────────────────────────────┐
+-- │             PARRY TAB                          │
+-- └────────────────────────────────────────────────┘
+
+local parryTab = Menu:Tab("Parry")
+
+local coreSection = parryTab:Section("Core")
+
+coreSection:Toggle("Auto Parry", S.parryOn, function(v)
+    S.parryOn = v
+    if v then
+        local n = 0; for _ in pairs(ANIM_DB) do n += 1 end
+        _G.AP_Notify(string.format("Auto Parry ON  (%d anims)", n), 4)
+        if n == 0 then _G.AP_Notify("⚠  ANIM_DB is empty!", 8) end
+    else
+        _G.AP_Notify("Auto Parry OFF", 3)
+    end
+end, false, "Automatically press F at the correct frame when a whitelisted attack is detected.")
+
+coreSection:Toggle("Scanner", S.showScanner, function(v)
+    S.showScanner = v
+    _G.AP_Notify(v and "Scanner ON — printing to output" or "Scanner OFF", 3)
+end, false, "Continuously prints nearby enemy animation data to the developer console.")
+
+coreSection:Toggle("Learning Mode", S.learningOn, function(v)
+    S.learningOn = v
+    _G.AP_Notify(v and "Learning ON — press F on hit to record timing"
+                     or "Learning OFF", 4)
+end, false, "Press F manually when an attack hits to record its timing.")
+
+local hitboxSection = parryTab:Section("Hitbox")
+
+hitboxSection:Toggle("Directional Hitbox", CFG.USE_HITBOX, function(v)
+    CFG.USE_HITBOX = v
+    _G.AP_Notify(v and "Directional hitbox ON" or "Hitbox OFF — distance only", 3)
+end, false, "Only parry when inside the enemy's forward attack cone.")
+
+hitboxSection:Slider("Parry Range", CFG.PARRY_RANGE, 1, 5, 50, " st", function(v)
+    CFG.PARRY_RANGE = v
+end)
+
+hitboxSection:Slider("Hitbox Width", CFG.HITBOX_WIDTH, 1, 4, 40, " st", function(v)
+    CFG.HITBOX_WIDTH = v
+end)
+
+hitboxSection:Slider("Hitbox Height", CFG.HITBOX_HEIGHT, 1, 4, 40, " st", function(v)
+    CFG.HITBOX_HEIGHT = v
+end)
+
+hitboxSection:Slider("Max Scan Dist", CFG.MAX_DISTANCE, 5, 10, 150, " st", function(v)
+    CFG.MAX_DISTANCE = v
+end)
+
+-- ┌────────────────────────────────────────────────┐
+-- │             TIMING TAB                         │
+-- └────────────────────────────────────────────────┘
+
+local timingTab = Menu:Tab("Timing")
+
+local timingSection = timingTab:Section("Timing Config")
+
+timingSection:Slider("Parry Window", math.floor(CFG.PARRY_WINDOW*1000), 5, 20, 300, " ms", function(v)
+    CFG.PARRY_WINDOW = v / 1000
+end)
+
+timingSection:Slider("Parry Cooldown", math.floor(CFG.PARRY_COOLDOWN*1000), 5, 50, 500, " ms", function(v)
+    CFG.PARRY_COOLDOWN = v / 1000
+end)
+
+timingSection:Slider("Key Hold Time", math.floor(CFG.PARRY_HOLD*1000), 5, 10, 200, " ms", function(v)
+    CFG.PARRY_HOLD = v / 1000
+end)
+
+timingSection:Slider("Max Learn Samples", CFG.MAX_SAMPLES, 1, 5, 50, "", function(v)
+    CFG.MAX_SAMPLES = v
+end)
+
+local actionsSection = timingTab:Section("Actions")
+
+actionsSection:Button("Export Overrides → Console", function()
+    ExportConfig()
+end)
+
+actionsSection:Button("Undo Last Recording", function()
+    if S.lastRecordedId then
+        local ss = S.learnedTimings[S.lastRecordedId]
+        if ss and #ss > 0 then
+            _G.AP_Notify(string.format("Undo: removed %.3fs (%d left)", ss[#ss], #ss-1), 3)
+            table.remove(ss, #ss)
+        end
+        S.lastRecordedId = nil
+    else
+        _G.AP_Notify("Nothing to undo.", 3)
+    end
+end)
+
+actionsSection:Button("Clear All Overrides & Stats", function()
+    S.learnedTimings = {}
+    S.parryCount     = 0
+    S.tracker        = {}
+    S.parryLog       = {}
+    _G.AP_Notify("Overrides cleared and stats reset.", 4)
+end)
+
+-- ┌────────────────────────────────────────────────┐
+-- │             STATS TAB                          │
+-- └────────────────────────────────────────────────┘
+
+local statsTab = Menu:Tab("Stats")
+
+local liveSection = statsTab:Section("Overview")
+
+do
+    local dbC = 0; for _ in pairs(ANIM_DB) do dbC += 1 end
+    liveSection:Toggle(string.format("DB Animations: %d", dbC), false, nil,
+        false, "Total animations registered in ANIM_DB.")
+end
+
+do
+    local ovrC = 0; for _ in pairs(S.learnedTimings) do ovrC += 1 end
+    liveSection:Toggle(string.format("Saved Overrides: %d", ovrC), false, nil,
+        false, "Overrides loaded from SAVED_DB on startup.")
+end
+
+liveSection:Button("Print Full Stats → Console", function()
+    local dbC2  = 0; for _ in pairs(ANIM_DB)         do dbC2  += 1 end
+    local ovrC2 = 0; for _ in pairs(S.learnedTimings) do ovrC2 += 1 end
+    print("=========================================")
+    print("   ☯  AUTO-PARRY v4.1 — UI Edition")
+    print("-----------------------------------------")
+    print(string.format("  Player:   %s", localPlayerName))
+    print(string.format("  FPS:      %d  |  Parries: %d", S.fps, S.parryCount))
+    print(string.format("  DB anims: %d  |  Overrides: %d", dbC2, ovrC2))
+    print(string.format("  Parry: %s  Learn: %s  Hitbox: %s",
+        S.parryOn and "ON" or "OFF",
+        S.learningOn and "ON" or "OFF",
+        CFG.USE_HITBOX and "ON" or "OFF"))
+    print(string.format("  Window: ±%.0fms  CD: %.0fms  Range: %d st",
+        CFG.PARRY_WINDOW*1000, CFG.PARRY_COOLDOWN*1000, CFG.PARRY_RANGE))
+    if ovrC2 > 0 then
+        print("\n  TIMING OVERRIDES:")
+        for id, samples in pairs(S.learnedTimings) do
+            if #samples > 0 then
+                local ad   = GetAnimData(id)
+                local w    = ad and ad[2] or "?"
+                local nm   = ad and ad[3] or "?"
+                local orig = ad and ad[1] or 0
+                local lrnd = GetParryTiming(id, ad or {0})
+                print(string.format("    %s/%s: %.3f → %.3f (%d samples)",
+                    w, nm, orig, lrnd, #samples))
+            end
+        end
+    end
+    if #S.parryLog > 0 then
+        print("\n  LAST 10 PARRIES:")
+        for i = math.max(1, #S.parryLog-9), #S.parryLog do
+            local l = S.parryLog[i]
+            print(string.format("    #%d  %s | %s  actual:%.3f target:%.3f",
+                i, l.enemy, l.anim, l.actual, l.target))
+        end
+    end
+    print("=========================================")
+    _G.AP_Notify("Stats printed to console.", 3)
+end)
+
+local logSection = statsTab:Section("Parry Log")
+
+logSection:Button("Show Last 5 Parries → Console", function()
+    if #S.parryLog == 0 then
+        _G.AP_Notify("No parries recorded yet.", 3); return
+    end
+    for i = math.max(1, #S.parryLog-4), #S.parryLog do
+        local l = S.parryLog[i]
+        print(string.format("#%d  %s | %s  actual:%.3f target:%.3f",
+            i, l.enemy, l.anim, l.actual, l.target))
+    end
+    _G.AP_Notify(string.format("Last %d parries printed.", math.min(5,#S.parryLog)), 3)
+end)
+
+logSection:Button("Clear Parry Log", function()
+    S.parryLog   = {}
+    S.parryCount = 0
+    _G.AP_Notify("Parry log cleared.", 3)
+end)
+
+-- ┌────────────────────────────────────────────────┐
+-- │           CONFIG / SETTINGS TAB               │
+-- └────────────────────────────────────────────────┘
+
+local _, menuSection = Menu:CreateSettingsTab("Config")
+
+menuSection:Button("Unload Auto Parry", function()
+    _G.AP_Notify("Unloading...", 2)
+    S.parryOn    = false
+    S.learningOn = false
+    task.wait(1.5)
+    Menu:Unload()
+end)
+
+-- ┌────────────────────────────────────────────────┐
+-- │                STARTUP                         │
+-- └────────────────────────────────────────────────┘
+
+ImportSavedDB()
+
+local dbCountInit = 0; for _ in pairs(ANIM_DB) do dbCountInit += 1 end
+
+print("=========================================")
+print("   ☯  AUTO-PARRY v4.1 — UI Edition")
+print(string.format("   Player: %s", localPlayerName))
+print("   F1 = Toggle Menu")
+print(string.format("   DB: %d animations", dbCountInit))
+print("=========================================")
+
+if dbCountInit == 0 then
+    warn("[AutoParry] ANIM_DB is empty — paste your animation database at the top!")
+    _G.AP_Notify("⚠  ANIM_DB is empty! Paste your DB at the top of the script.", 10)
+else
+    _G.AP_Notify(string.format(
+        "☯  Loaded! %d animations in DB.  Press F1 for menu.", dbCountInit), 7)
+end
+
+-- ┌────────────────────────────────────────────────┐
+-- │              MAIN LOOP                         │
+-- └────────────────────────────────────────────────┘
+
+while true do
+    Menu:Step()
+    task.wait()
+end
