@@ -691,12 +691,8 @@ end)
 -- │              LOAD UI LIBRARY                   │
 -- └────────────────────────────────────────────────┘
 
-local Menu = loadstring(game:HttpGet(
-    "https://raw.githubusercontent.com/catowice/p/refs/heads/main/library.lua"
-))()
-
-assert(type(Menu) == "table",
-    "[AutoParry] UI library failed to load. Check executor HTTP permissions.")
+loadstring(game:HttpGet("https://raw.githubusercontent.com/catowice/p/refs/heads/main/library.lua"))()
+local Menu = UILib -- library sets UILib as a global, it does not return a value
 
 -- ┌────────────────────────────────────────────────┐
 -- │       YIN & YANG THEME                         │
